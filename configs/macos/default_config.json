@@ -1,6 +1,6 @@
 {
   "debugMode": false,
   "logPath": "~/Library/Logs/TimeWhisperer/time-whisperer.log",
-  "upworkLogsDir": "~/Library/Application Support/Upwork/Upwork/Logs",
+  "upworkLogsDir": "",
   "webSocketPort": 8887
 } 

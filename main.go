@@ -85,7 +85,7 @@ func DefaultConfig() Config {
 	return Config{
 		DebugMode:     false,
 		LogPath:       filepath.Join(home, "time-whisperer.log"),
-		UpworkLogsDir: getDefaultLogDir(),
+		UpworkLogsDir: "", // Empty - will be discovered and filled in
 		WebSocketPort: 8887,
 	}
 }
@@ -154,6 +154,77 @@ func getDefaultLogDir() string {
 	}
 }
 
+// discoverUpworkLogsDir tries to find the actual Upwork logs directory
+// by checking predefined locations and verifying they contain log files
+func discoverUpworkLogsDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+
+	var candidatePaths []string
+	
+	switch runtime.GOOS {
+	case "darwin":
+		candidatePaths = []string{
+			filepath.Join(home, "Library", "Application Support", "Upwork", "Upwork", "Logs"),
+		}
+	case "windows":
+		candidatePaths = []string{
+			filepath.Join(home, "AppData", "Roaming", "Upwork", "Logs"),
+		}
+	default: // linux
+		candidatePaths = []string{
+			filepath.Join(home, ".config", "Upwork", "Logs"),
+			filepath.Join(home, ".Upwork", "Upwork", "Logs"),
+		}
+	}
+
+	for _, path := range candidatePaths {
+		log.Printf("Checking for Upwork logs in: %s", path)
+		
+		// Check if directory exists
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			log.Printf("Directory does not exist: %s", path)
+			continue
+		}
+		
+		// Check if directory contains upwork log files
+		pattern := filepath.Join(path, "upwork.*.log")
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			log.Printf("Error checking for log files in %s: %v", path, err)
+			continue
+		}
+		
+		if len(matches) > 0 {
+			log.Printf("Found %d upwork log file(s) in: %s", len(matches), path)
+			return path
+		} else {
+			log.Printf("No upwork log files found in: %s", path)
+		}
+	}
+	
+	// Return empty string if no valid location found
+	log.Printf("No valid Upwork logs directory discovered")
+	return ""
+}
+
+// ensureUpworkLogsDir checks if UpworkLogsDir is empty and discovers it if needed
+func ensureUpworkLogsDir(cfg *Config) {
+	if cfg.UpworkLogsDir == "" {
+		log.Printf("UpworkLogsDir is empty, attempting to discover...")
+		if discoveredPath := discoverUpworkLogsDir(); discoveredPath != "" {
+			cfg.UpworkLogsDir = discoveredPath
+			log.Printf("Discovered and set UpworkLogsDir: %s", discoveredPath)
+		} else {
+			// Fallback to platform default if discovery fails
+			cfg.UpworkLogsDir = getDefaultLogDir()
+			log.Printf("Discovery failed, using default UpworkLogsDir: %s", cfg.UpworkLogsDir)
+		}
+	}
+}
+
 // getBundledConfigPath returns the path to the OS-specific bundled default config
 func getBundledConfigPath() string {
 	// Get the executable path
@@ -219,6 +290,15 @@ func loadConfig(p string) (Config, string, error) {
 			log.Printf("config: backed up invalid file to %s", bakPath)
 			return Config{}, "", fmt.Errorf("invalid json: %w", err)
 		}
+		
+		// Ensure UpworkLogsDir is discovered if empty
+		originalDir := c.UpworkLogsDir
+		ensureUpworkLogsDir(&c)
+		if c.UpworkLogsDir != originalDir {
+			// UpworkLogsDir was updated, save the improved config
+			_ = saveConfig(c, p)
+		}
+		
 		configSource = fmt.Sprintf("User config: %s", p)
 		return c, configSource, nil
 	} else if !os.IsNotExist(err) {
@@ -232,6 +312,9 @@ func loadConfig(p string) (Config, string, error) {
 		if b, err := os.ReadFile(bundledPath); err == nil {
 			var c Config
 			if err := json.Unmarshal(b, &c); err == nil {
+				// Ensure UpworkLogsDir is discovered if empty
+				ensureUpworkLogsDir(&c)
+				
 				// Save a copy to user config path
 				_ = saveConfig(c, p)
 				configSource = fmt.Sprintf("Bundled config: %s", bundledPath)
@@ -242,6 +325,10 @@ func loadConfig(p string) (Config, string, error) {
 
 	// Fallback to hardcoded defaults if no configs could be loaded
 	c := DefaultConfig()
+	
+	// Ensure UpworkLogsDir is discovered if empty
+	ensureUpworkLogsDir(&c)
+	
 	_ = saveConfig(c, p)
 	configSource = "Default hardcoded config (no config file found)"
 	return c, configSource, nil
@@ -814,6 +901,13 @@ func main() {
 	cfg, configSource, err := loadConfig(cfgPath)
 	if err != nil {
 		log.Fatalf("Unable to read config %s: %v", cfgPath, err)
+	}
+
+	// Log which config file is being used (convert to absolute path for clarity)
+	if absCfgPath, err := filepath.Abs(cfgPath); err == nil {
+		log.Printf("Config file path: %s", absCfgPath)
+	} else {
+		log.Printf("Config file path: %s", cfgPath)
 	}
 
 	// Log full config
