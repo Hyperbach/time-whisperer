@@ -67,4 +67,9 @@ PLISTEOF
   || /bin/launchctl asuser "$USER_UID" /bin/launchctl load -w "$PLIST" 2>/dev/null \
   || true
 
+# Open the control panel once, in the console user's GUI session, so they can see
+# it installed and where it lives. The daemon itself stays headless; this only
+# surfaces the user-facing app at install time. Best-effort — never fail install.
+/bin/launchctl asuser "$USER_UID" /usr/bin/open "$APP" 2>/dev/null || true
+
 exit 0

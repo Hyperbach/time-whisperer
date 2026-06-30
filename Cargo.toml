@@ -1,6 +1,6 @@
 [package]
 name = "time-whisperer"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "SneakTime — Upwork screenshot monitor daemon"
 license = "MIT"
