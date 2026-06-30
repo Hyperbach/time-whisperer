@@ -32,9 +32,19 @@ PKGROOT="$WORK/root"
 mkdir -p "$PKGROOT/Applications"
 cp -R "$APP" "$PKGROOT/Applications/"
 
+# Disable bundle relocation. By default pkgbuild marks .app bundles relocatable,
+# so macOS Installer will "shove" the install onto any other registered copy of
+# Worklog.app (a mounted DMG, a dev build in dist/, …) instead of /Applications.
+# A component plist with BundleIsRelocatable=false forces the declared location.
+echo "==> pkgbuild --analyze (pin install location)..."
+pkgbuild --analyze --root "$PKGROOT" "$WORK/component.plist"
+# The analyze output is an array of bundle dicts; force every bundle's flag false.
+/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$WORK/component.plist"
+
 echo "==> pkgbuild (payload + postinstall)..."
 pkgbuild \
   --root "$PKGROOT" \
+  --component-plist "$WORK/component.plist" \
   --install-location / \
   --scripts "$ROOT/installer/scripts" \
   --identifier "$PKG_ID" \
