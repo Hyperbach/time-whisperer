@@ -1,118 +1,95 @@
-# Verifying Time Whisperer Releases
+# Verifying Worklog / Time Whisperer releases
 
-This document explains how to verify that a Time Whisperer binary you downloaded is authentic and unmodified.
+This explains how to confirm that a download from the
+[Releases](https://github.com/Hyperbach/time-whisperer/releases) page is
+authentic and unmodified.
 
-## Why Verify?
+## What's published
 
-Verifying software ensures that the binary you're running:
-1. Was built from the exact source code in the repository
-2. Hasn't been tampered with or modified
-3. Is signed by the official Time Whisperer developers
+Each release includes, with a `.sha256` sidecar for every file:
 
-## Quick Verification
+- `Worklog-<version>-macos-arm64.pkg` — macOS installer (Developer ID signed + notarized)
+- `Worklog-<version>-macos-arm64.dmg` — macOS drag-to-Applications image (signed + notarized)
+- `time-whisperer-linux-amd64` — Linux daemon binary
 
-Each release includes three files for each binary:
-- The binary itself (e.g., `timewhisperer-macos-amd64`)
-- A SHA256 hash file (e.g., `timewhisperer-macos-amd64.sha256`)
-- A GPG signature of the hash file (e.g., `timewhisperer-macos-amd64.sha256.asc`)
+## 1. Verify the SHA-256 hash (all platforms)
 
-### Using the Included Verification Script
-
-The easiest way to verify your download is to use the included verification script:
-
-**On macOS:**
+**macOS**
 ```bash
-/Applications/TimeWhisperer.app/Contents/MacOS/verify-binary
+shasum -a 256 -c Worklog-1.0.3-macos-arm64.pkg.sha256
 ```
 
-**On Linux:**
+**Linux**
 ```bash
-/usr/lib/time-whisperer/verify-binary /usr/bin/time-whisperer
+sha256sum -c time-whisperer-linux-amd64.sha256
 ```
 
-## Manual Verification (Step by Step)
+You should see `… OK`.
 
-If you prefer to verify manually:
+## 2. Verify the macOS signature & notarization
 
-### 1. Verify the SHA256 hash
+The macOS artifacts are signed with Apple **Developer ID** and **notarized** by
+Apple, under the team **Hyperbach Services OÜ (Team ID `9QNDK63AV5`)**. You don't
+need any key — Gatekeeper checks this automatically on first open — but you can
+verify explicitly:
 
-**On macOS:**
+**The installer `.pkg`**
 ```bash
-shasum -a 256 -c timewhisperer-macos-amd64.sha256
+pkgutil --check-signature Worklog-1.0.3-macos-arm64.pkg
+# Expect a valid chain ending in:
+#   Developer ID Installer: Hyperbach Services OU (9QNDK63AV5)
+
+xcrun stapler validate Worklog-1.0.3-macos-arm64.pkg
+# Expect: The validate action worked!
 ```
 
-**On Linux:**
+**The `.dmg`**
 ```bash
-sha256sum -c timewhisperer-linux-amd64.sha256
+xcrun stapler validate Worklog-1.0.3-macos-arm64.dmg
+spctl -a -t open --context context:primary-signature -vv Worklog-1.0.3-macos-arm64.dmg
+# Expect: accepted / source=Notarized Developer ID
 ```
 
-You should see: `timewhisperer-*: OK`
-
-### 2. Import the GPG public key
-
-Choose one of these methods to import the Time Whisperer public key:
-
-#### Method A: Import from GitHub (Recommended)
+**The installed app**
 ```bash
-# Download the public key directly from GitHub
-curl -s https://github.com/hyperbach-git.gpg | gpg --import
+codesign -dv --verbose=4 /Applications/Worklog.app
+#   Authority=Developer ID Application: Hyperbach Services OU (9QNDK63AV5)
+#   TeamIdentifier=9QNDK63AV5
+
+spctl -a -vvv /Applications/Worklog.app
+#   accepted, source=Notarized Developer ID
 ```
 
-#### Method B: Import from release assets
+If those checks pass, the build came from this repository's signing identity and
+was notarized by Apple — it has not been tampered with.
+
+## 3. The Linux binary
+
+The Linux binary is verified by its SHA-256 hash (step 1). It is not code-signed
+(Linux has no equivalent system trust mechanism); rebuild from source if you want
+end-to-end assurance — see below.
+
+## Rebuild from source
+
+For maximum confidence, build the same tag yourself with a stable Rust toolchain:
+
 ```bash
-# Download and import the public key from release assets
-gpg --import hyperbach-public-key.asc
+git clone https://github.com/Hyperbach/time-whisperer.git
+cd time-whisperer
+git checkout v1.0.3            # the version you're verifying
+cargo build --release --locked
+# target/release/time-whisperer
 ```
 
-### 3. Verify the GPG signature
+`--locked` builds against the committed `Cargo.lock`, so dependency versions match
+exactly what CI used. (Note: the CI release artifacts are signed/stapled, so they
+are not byte-identical to a local build — compare behavior and provenance, not raw
+bytes.)
 
-Then verify the signature:
+## If verification fails
 
-```bash
-gpg --verify timewhisperer-*.sha256.asc timewhisperer-*.sha256
-```
-
-You should see: `Good signature from "Hyperbach (Time Whisperer Release Signing Key) <root@hyperbach.com>"`
-
-## Advanced Verification: Reproducible Build
-
-For maximum confidence, you can rebuild from source and verify that the binary matches:
-
-1. Install Nix (if not already installed):
-   ```bash
-   curl -L https://nixos.org/nix/install | sh
-   ```
-
-2. Clone the repository:
-   ```bash
-   git clone https://github.com/Hyperbach/time-whisperer.git
-   cd time-whisperer
-   ```
-
-3. Check out the exact tag for the version you want to verify:
-   ```bash
-   git checkout v1.0.0  # Replace with your version
-   ```
-
-4. Build using Nix:
-   ```bash
-   nix build
-   ```
-
-5. Compare the result with your downloaded binary:
-   ```bash
-   # Using cmp for a binary comparison:
-   cmp ./result/bin/timewhisperer /path/to/downloaded/timewhisperer
-   
-   # No output means the files are identical
-   ```
-
-## What If Verification Fails?
-
-If verification fails:
-
-1. Make sure you downloaded files from the official GitHub releases page
-2. Check if you're using the correct files for verification
-3. Ensure your GPG keyring has the correct public key
-4. Try importing the key using a different method (see Method A or B above)
-5. If problems persist, please open an issue on GitHub 
+1. Confirm you downloaded from the official Releases page above.
+2. Re-download — a partial/corrupted download fails the hash check.
+3. For macOS signature checks, make sure you're on the actual file (not a copy
+   stripped of extended attributes by some transfer tools).
+4. If problems persist, open an issue on GitHub.
