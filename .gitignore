@@ -1,70 +1,58 @@
-# Binaries for programs and plugins
+# Binary files
+time-whisperer
+timewhisperer
+result
+result-*
 *.exe
-*.exe~
 *.dll
 *.so
 *.dylib
-time-whisperer
-time-whisperer.exe
+
+# Nix
+.direnv
+.pre-commit-config.yaml
+
+# Build outputs
+build/
+dist/
+releases/
+*.dmg
+*.deb
+*.sha256
+*.sha256.asc
+
+# Secrets / local config — never commit (public repo safety net)
+# config.json is generated at build/run and gets rewritten with the local
+# Upwork logs path; *.asc covers any exported GPG keys.
+config.json
+*.asc
 
 # Test binary, built with `go test -c`
 *.test
 
-# Output of the go coverage tool, specifically when used with LiteIDE
+# Output of the go coverage tool
 *.out
 
-# Dependency directories (remove the comment below to include it)
+# Logs and temporary files
+*.log
+*.tmp
+.DS_Store
+
+# Dependency directories
 vendor/
 
-# Go workspace file
+# Rust
+target/
+Cargo.lock.bak
+
+# Go (legacy)
 go.work
+time-whisperer.app
+.idea
 
-# Build artifacts
-build/
-dist/
-*.dmg
-*.deb
-*.rpm
-*.tar.gz
-*.zip
+time-whisperer-backend
+work.md
 
-# macOS app bundle
-*.app/
-
-# Configuration files (local development)
-config.json
-
-# Log files
-*.log
-logs/
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Nix build results
-result*
-
-# Temporary files
-*.tmp
-*.temp
-
-# Coverage reports
-coverage.out
-coverage.html
-
-# Local environment files
-.env
-.env.local
+.private-keys.md
+toast-stacker
+safe-break-buddy

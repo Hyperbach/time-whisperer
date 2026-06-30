@@ -1,453 +1,210 @@
 name: Release Build
 
+# Self-contained Rust pipeline:
+#   * every push / PR  -> build + test on Linux and macOS
+#   * tag push (v*)    -> build release artifacts (.dmg / .deb / raw binaries)
+#                         and publish a GitHub Release
+#
+# No Nix required: the daemon and CLI build with plain `cargo build --release`.
+# The macOS GUI (worklog-gui, eframe) is target-gated to macOS in Cargo.toml,
+# so the Linux jobs never pull GUI native dependencies.
+
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-macos:
-    name: Build macOS Release
-    runs-on: macos-latest
+  test:
+    name: Build & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-14 ]
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch all history for tags
-          
-      - name: Setup Nix access to GitHub
-        run: |
-          mkdir -p ~/.config/nix
-          echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
-          echo "access-tokens = github.com=${{ github.token }}" >> ~/.config/nix/nix.conf
+          fetch-depth: 0  # build.rs reads git for version metadata
 
-      - name: Install Nix
-        run: |
-          curl -L https://nixos.org/nix/install | sh
-          # Add Nix to path and setup flakes
-          
-          # Sourcing the nix-daemon profile instead of nix.sh
-          echo 'source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' >> $HOME/.bash_profile
-          source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up GPG
-        if: env.GPG_PRIVATE_KEY != ''
-        uses: crazy-max/ghaction-import-gpg@v6
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Test
+        # Integration tests spawn the daemon and bind localhost ports; run them
+        # serially to avoid port contention (mirrors run_integration_tests.sh).
+        run: cargo test --locked -- --test-threads=1
+
+  build-macos:
+    name: Package macOS (arm64)
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Apple Silicon only. GitHub is retiring Intel (macos-13) runners and they no
+    # longer get allocated for this repo, so an Intel matrix leg hangs forever.
+    # Intel coverage can be added later via a universal2 (lipo) build on this same
+    # runner — no Intel runner required.
+    runs-on: macos-14
+    # Signing/notarization secrets (repo Settings → Secrets and variables → Actions).
+    # If absent, the build still runs and produces ad-hoc artifacts (Gatekeeper needs
+    # right-click → Open). With them present, artifacts are Developer-ID signed +
+    # notarized + stapled → clean double-click install.
+    env:
+      APPLE_DEVELOPER_ID_APP: ${{ secrets.APPLE_DEVELOPER_ID_APP }}
+      APPLE_DEVELOPER_ID_INSTALLER: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER }}
+      APPLE_CERT_APP_P12_BASE64: ${{ secrets.APPLE_CERT_APP_P12_BASE64 }}
+      APPLE_CERT_INSTALLER_P12_BASE64: ${{ secrets.APPLE_CERT_INSTALLER_P12_BASE64 }}
+      APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
         with:
-          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
-          passphrase: ${{ secrets.GPG_PASSPHRASE }}
-          trust_level: 5
-          git_user_signingkey: true
-          git_commit_gpgsign: true
-          git_tag_gpgsign: true
-        id: import_gpg
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          fetch-depth: 0
 
-      - name: Check GPG Status
-        run: |
-          source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-          
-          if [[ -z "${{ secrets.GPG_PRIVATE_KEY }}" ]]; then
-            echo "::notice::GPG private key not provided. Builds will be created without signatures."
-            echo "SKIP_SIGNING=true" >> $GITHUB_ENV
-          else
-            echo "::notice::GPG signing is enabled."
-            echo "SKIP_SIGNING=false" >> $GITHUB_ENV
-          fi
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build with Nix
-        run: |
-          source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-          mkdir -p dist
-          
-          # Export public key for release assets (if signing is enabled)
-          if [[ "${{ secrets.GPG_PRIVATE_KEY }}" ]]; then
-            gpg --armor --export ${{ secrets.GPG_KEY_ID }} > dist/hyperbach-public-key.asc
-          fi
-          
-          # Build with Nix and capture the build path
-          nix build .#default --system x86_64-darwin --out-link result-macos-amd64
-          
-          # Examine the build result
-          echo "Contents of Nix build result:"
-          ls -la result-macos-amd64
-          
-          # Determine the actual path (follow symlink)
-          STORE_PATH=$(readlink -f result-macos-amd64)
-          echo "Actual store path: $STORE_PATH"
-          
-          # Look for any executables recursively, following symlinks
-          echo "Searching for executables in the build result:"
-          find -L $STORE_PATH -type f -perm +111 | sort
-          
-          # Create the binary output
-          if [ -f $STORE_PATH/bin/timewhisperer ]; then
-            echo "Found binary at standard location (bin/timewhisperer)"
-            cp $STORE_PATH/bin/timewhisperer dist/timewhisperer-macos-amd64
-          elif [ -f $STORE_PATH/timewhisperer ]; then
-            echo "Found binary at root of output"
-            cp $STORE_PATH/timewhisperer dist/timewhisperer-macos-amd64
-          else
-            echo "Trying to determine binary location from file type..."
-            # Try to find Go binaries
-            BINARY_PATH=$(find -L $STORE_PATH -type f -perm +111 -exec file {} \; | grep "Mach-O 64-bit executable" | head -1 | cut -d: -f1)
-            
-            if [ -n "$BINARY_PATH" ]; then
-              echo "Found binary at: $BINARY_PATH"
-              cp "$BINARY_PATH" dist/timewhisperer-macos-amd64
-            else
-              echo "ERROR: Could not locate the binary in the build output"
-              find -L $STORE_PATH -type f | xargs file | grep executable
-              exit 1
-            fi
-          fi
-          
-          shasum -a 256 dist/timewhisperer-macos-amd64 > dist/timewhisperer-macos-amd64.sha256
-          echo "Built amd64 binary with SHA256:"
-          cat dist/timewhisperer-macos-amd64.sha256
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Build ARM64 with Nix (if possible)
-        continue-on-error: true
+      - name: Import Developer ID certificates
+        if: env.APPLE_CERT_APP_P12_BASE64 != ''
         run: |
-          source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-          mkdir -p dist
-          
-          # Build with Nix and capture the build path
-          nix build .#default --system aarch64-darwin --out-link result-macos-arm64
-          
-          # Examine the build result
-          echo "Contents of Nix build result:"
-          ls -la result-macos-arm64
-          
-          # Determine the actual path (follow symlink)
-          STORE_PATH=$(readlink -f result-macos-arm64)
-          echo "Actual store path: $STORE_PATH"
-          
-          # Look for any executables recursively, following symlinks
-          echo "Searching for executables in the build result:"
-          find -L $STORE_PATH -type f -perm +111 | sort
-          
-          # Create the binary output
-          if [ -f $STORE_PATH/bin/timewhisperer ]; then
-            echo "Found binary at standard location (bin/timewhisperer)"
-            cp $STORE_PATH/bin/timewhisperer dist/timewhisperer-macos-arm64
-          elif [ -f $STORE_PATH/timewhisperer ]; then
-            echo "Found binary at root of output"
-            cp $STORE_PATH/timewhisperer dist/timewhisperer-macos-arm64
-          else
-            echo "Trying to determine binary location from file type..."
-            # Try to find Go binaries
-            BINARY_PATH=$(find -L $STORE_PATH -type f -perm +111 -exec file {} \; | grep "Mach-O 64-bit executable" | head -1 | cut -d: -f1)
-            
-            if [ -n "$BINARY_PATH" ]; then
-              echo "Found binary at: $BINARY_PATH"
-              cp "$BINARY_PATH" dist/timewhisperer-macos-arm64
-            else
-              echo "ERROR: Could not locate the binary in the build output"
-              find -L $STORE_PATH -type f | xargs file | grep executable
-              exit 1
-            fi
-          fi
-          
-          shasum -a 256 dist/timewhisperer-macos-arm64 > dist/timewhisperer-macos-arm64.sha256
-          echo "Built arm64 binary with SHA256:"
-          cat dist/timewhisperer-macos-arm64.sha256
-
-      - name: Create DMG Package
-        run: |
-          source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
-          BINARY_PATH=dist/timewhisperer-macos-amd64
-          
-          # Check if we have an Apple Developer ID for code signing
-          if [[ -n "${{ secrets.APPLE_DEVELOPER_ID }}" ]]; then
-            echo "Apple Developer ID found. Will code sign the application."
-            # Create a keychain and import the certificate
-            echo "${{ secrets.APPLE_DEVELOPER_CERTIFICATE_P12_BASE64 }}" | base64 --decode > certificate.p12
-            security create-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
-            security default-keychain -s build.keychain
-            security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
-            security import certificate.p12 -k build.keychain -P "${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
-            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
-            # Export the developer ID for the packaging script
-            export APPLE_DEVELOPER_ID="${{ secrets.APPLE_DEVELOPER_ID }}"
-          else
-            echo "No Apple Developer ID found. App will not be code signed."
-            # Make sure the variable is empty so the script knows not to sign
-            export APPLE_DEVELOPER_ID=""
-          fi
-          
-          # Run the packaging script with the environment variables set
-          VERSION=$VERSION BINARY_PATH=$BINARY_PATH APPLE_DEVELOPER_ID=$APPLE_DEVELOPER_ID ./package-macos.sh
-          
-          shasum -a 256 TimeWhisperer-$VERSION.dmg > dist/TimeWhisperer-$VERSION.dmg.sha256
-          cp TimeWhisperer-$VERSION.dmg dist/
-          
-          # Clean up
-          if [[ -n "${{ secrets.APPLE_DEVELOPER_ID }}" ]]; then
-            security delete-keychain build.keychain
-            rm certificate.p12
-          fi
-
-      - name: Sign hashes with GPG
-        if: env.SKIP_SIGNING != 'true'
-        env:
-          GPG_KEY_ID: ${{ steps.import_gpg.outputs.keyid }}
-        run: |
-          # Sign each hash file
-          for hashfile in dist/*.sha256; do
-            echo "Signing ${hashfile}..."
-            gpg --batch --yes --armor --detach-sign --local-user "${GPG_KEY_ID}" "${hashfile}"
-            echo "✓ Signed ${hashfile}"
+          KC="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
+          # Two single-identity .p12s (app + installer), imported separately so
+          # both identities form (a combined .p12 only yields the first).
+          echo "$APPLE_CERT_APP_P12_BASE64"       | base64 --decode > "$RUNNER_TEMP/app.p12"
+          echo "$APPLE_CERT_INSTALLER_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/installer.p12"
+          for p12 in app installer; do
+            security import "$RUNNER_TEMP/$p12.p12" -k "$KC" -P "$APPLE_CERT_PASSWORD" \
+              -T /usr/bin/codesign -T /usr/bin/productsign -T /usr/bin/productbuild
           done
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KC"
+          # Make the signing keychain searchable (keep the login keychain too).
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/installer.p12"
+          echo "=== signing identities available (cert names, not secret) ==="
+          security find-identity -v || true
+          security find-identity -v -p basic 2>/dev/null | grep -i "Developer ID" || true
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Build .app, .dmg, and .pkg installer
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # package-pkg.sh builds the .app + .dmg (via package-app.sh) + the .pkg wizard.
+          # Signs with Developer ID when APPLE_DEVELOPER_ID_APP/INSTALLER are set.
+          VERSION="$VERSION" ./package-pkg.sh
+
+      - name: Notarize & staple
+        if: env.APPLE_NOTARY_KEY_P8_BASE64 != ''
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          KEY="$RUNNER_TEMP/notary.p8"
+          echo "$APPLE_NOTARY_KEY_P8_BASE64" | base64 --decode > "$KEY"
+          for f in "dist/Worklog-${VERSION}.pkg" "dist/Worklog-${VERSION}.dmg"; do
+            echo "==> notarizing $f"
+            xcrun notarytool submit "$f" --key "$KEY" \
+              --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait
+            xcrun stapler staple "$f"
+          done
+          rm -f "$KEY"
+
+      - name: Collect artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p out
+          cp "dist/Worklog-${VERSION}.pkg" "out/Worklog-${VERSION}-macos-arm64.pkg"
+          cp "dist/Worklog-${VERSION}.dmg" "out/Worklog-${VERSION}-macos-arm64.dmg"
+          cd out
+          for f in $(ls); do shasum -a 256 "$f" > "$f.sha256"; done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: macos-binaries
-          path: dist/
+          name: macos-arm64
+          path: out/
           retention-days: 1
 
   build-linux:
-    name: Build Linux Release
+    name: Package Linux (amd64)
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # NOTE: amd64 only for now. Linux arm64 can be added later via a cross
+    # toolchain (e.g. cross / cargo-zigbuild) + an arm64 .deb.
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch all history for tags
-          
-      - name: Setup Nix access to GitHub
-        run: |
-          mkdir -p ~/.config/nix
-          echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
-          echo "access-tokens = github.com=${{ github.token }}" >> ~/.config/nix/nix.conf
+          fetch-depth: 0
 
-      - name: Install Nix
-        run: |
-          curl -L https://nixos.org/nix/install | sh
-          # Add Nix to path and setup flakes
-          
-          # Use the single-user profile path instead of nix-daemon.sh
-          echo 'source $HOME/.nix-profile/etc/profile.d/nix.sh' >> $HOME/.bashrc
-          source $HOME/.nix-profile/etc/profile.d/nix.sh
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Check GPG Status
-        run: |
-          # Make sure we source the Nix environment
-          source $HOME/.nix-profile/etc/profile.d/nix.sh
-          
-          if [[ -z "${{ secrets.GPG_PRIVATE_KEY }}" ]]; then
-            echo "::notice::GPG private key not provided. Builds will be created without signatures."
-            echo "SKIP_SIGNING=true" >> $GITHUB_ENV
-          else
-            echo "::notice::GPG signing is enabled."
-            echo "SKIP_SIGNING=false" >> $GITHUB_ENV
-          fi
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Set up GPG
-        if: env.GPG_PRIVATE_KEY != ''
-        uses: crazy-max/ghaction-import-gpg@v6
+      - name: Build daemon
+        run: cargo build --release --locked --bin time-whisperer
+
+      - name: Collect artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p out
+          cp target/release/time-whisperer "out/time-whisperer-linux-amd64"
+          cd out
+          for f in $(ls); do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
         with:
-          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
-          passphrase: ${{ secrets.GPG_PASSPHRASE }}
-          trust_level: 5
-          git_user_signingkey: true
-          git_commit_gpgsign: true
-          git_tag_gpgsign: true
-        id: import_gpg
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-
-      - name: Build with Nix
-        run: |
-          source $HOME/.nix-profile/etc/profile.d/nix.sh
-          mkdir -p dist
-          
-          # Export public key for release assets (if signing is enabled)
-          if [[ "${{ secrets.GPG_PRIVATE_KEY }}" ]]; then
-            gpg --armor --export ${{ secrets.GPG_KEY_ID }} > dist/hyperbach-public-key.asc
-          fi
-          
-          # Build with Nix and capture the build path
-          nix build .#default --system x86_64-linux --out-link result-linux-amd64
-          
-          # Examine the build result
-          echo "Contents of Nix build result:"
-          ls -la result-linux-amd64
-          
-          # Determine the actual path (follow symlink)
-          STORE_PATH=$(readlink -f result-linux-amd64)
-          echo "Actual store path: $STORE_PATH"
-          
-          # Look for any executables recursively, following symlinks
-          echo "Searching for executables in the build result:"
-          find -L $STORE_PATH -type f -executable | sort
-          
-          # Create the binary output
-          if [ -f $STORE_PATH/bin/timewhisperer ]; then
-            echo "Found binary at standard location (bin/timewhisperer)"
-            cp $STORE_PATH/bin/timewhisperer dist/timewhisperer-linux-amd64
-          elif [ -f $STORE_PATH/timewhisperer ]; then
-            echo "Found binary at root of output"
-            cp $STORE_PATH/timewhisperer dist/timewhisperer-linux-amd64
-          else
-            echo "Trying to determine binary location from file type..."
-            # Try to find ELF binaries
-            BINARY_PATH=$(find -L $STORE_PATH -type f -executable -exec file {} \; | grep "ELF 64-bit" | head -1 | cut -d: -f1)
-            
-            if [ -n "$BINARY_PATH" ]; then
-              echo "Found binary at: $BINARY_PATH"
-              cp "$BINARY_PATH" dist/timewhisperer-linux-amd64
-            else
-              echo "ERROR: Could not locate the binary in the build output"
-              find -L $STORE_PATH -type f | xargs file | grep executable
-              exit 1
-            fi
-          fi
-          
-          sha256sum dist/timewhisperer-linux-amd64 > dist/timewhisperer-linux-amd64.sha256
-          echo "Built amd64 binary with SHA256:"
-          cat dist/timewhisperer-linux-amd64.sha256
-
-      - name: Build ARM64 with Nix (if possible)
-        continue-on-error: true
-        run: |
-          source $HOME/.nix-profile/etc/profile.d/nix.sh
-          mkdir -p dist
-          
-          # Build with Nix and capture the build path
-          nix build .#default --system aarch64-linux --out-link result-linux-arm64
-          
-          # Examine the build result
-          echo "Contents of Nix build result:"
-          ls -la result-linux-arm64
-          
-          # Determine the actual path (follow symlink)
-          STORE_PATH=$(readlink -f result-linux-arm64)
-          echo "Actual store path: $STORE_PATH"
-          
-          # Look for any executables recursively, following symlinks
-          echo "Searching for executables in the build result:"
-          find -L $STORE_PATH -type f -executable | sort
-          
-          # Create the binary output
-          if [ -f $STORE_PATH/bin/timewhisperer ]; then
-            echo "Found binary at standard location (bin/timewhisperer)"
-            cp $STORE_PATH/bin/timewhisperer dist/timewhisperer-linux-arm64
-          elif [ -f $STORE_PATH/timewhisperer ]; then
-            echo "Found binary at root of output"
-            cp $STORE_PATH/timewhisperer dist/timewhisperer-linux-arm64
-          else
-            echo "Trying to determine binary location from file type..."
-            # Try to find ELF binaries
-            BINARY_PATH=$(find -L $STORE_PATH -type f -executable -exec file {} \; | grep "ELF 64-bit" | head -1 | cut -d: -f1)
-            
-            if [ -n "$BINARY_PATH" ]; then
-              echo "Found binary at: $BINARY_PATH"
-              cp "$BINARY_PATH" dist/timewhisperer-linux-arm64
-            else
-              echo "ERROR: Could not locate the binary in the build output"
-              find -L $STORE_PATH -type f | xargs file | grep executable
-              exit 1
-            fi
-          fi
-          
-          sha256sum dist/timewhisperer-linux-arm64 > dist/timewhisperer-linux-arm64.sha256
-          echo "Built arm64 binary with SHA256:"
-          cat dist/timewhisperer-linux-arm64.sha256
-
-      - name: Create DEB Package
-        run: |
-          source $HOME/.nix-profile/etc/profile.d/nix.sh
-          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
-          BINARY_PATH=dist/timewhisperer-linux-amd64
-          VERSION=$VERSION BINARY_PATH=$BINARY_PATH ./create-ubuntu-deb.sh
-          sha256sum time-whisperer_${VERSION}_amd64.deb > dist/time-whisperer_${VERSION}_amd64.deb.sha256
-          cp time-whisperer_${VERSION}_amd64.deb dist/
-
-      - name: Sign hashes with GPG
-        if: env.SKIP_SIGNING != 'true'
-        env:
-          GPG_KEY_ID: ${{ steps.import_gpg.outputs.keyid }}
-        run: |
-          # Sign each hash file
-          for hashfile in dist/*.sha256; do
-            echo "Signing ${hashfile}..."
-            gpg --batch --yes --armor --detach-sign --local-user "${GPG_KEY_ID}" "${hashfile}"
-            echo "✓ Signed ${hashfile}"
-          done
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-binaries
-          path: dist/
+          name: linux-amd64
+          path: out/
           retention-days: 1
 
-  create-release:
+  release:
     name: Create GitHub Release
-    needs: [build-macos, build-linux]
+    needs: [ build-macos, build-linux ]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts/
+          path: artifacts
 
-      - name: Prepare release assets
+      - name: Stage release assets
         run: |
           mkdir -p release-assets
-          cp artifacts/macos-binaries/* release-assets/ || true
-          cp artifacts/linux-binaries/* release-assets/ || true
-          ls -la release-assets/
-
-      - name: Check GPG Status
-        run: |
-          if [[ -z "${{ secrets.GPG_PRIVATE_KEY }}" ]]; then
-            echo "::notice::GPG signing was not available for this build."
-            echo "SIGNING_MESSAGE=Note: This release was built without GPG signatures. For signed releases, please set up the appropriate GPG secrets." >> $GITHUB_ENV
-          else
-            echo "SIGNING_MESSAGE=These binaries include GPG signatures for verification. See instructions below." >> $GITHUB_ENV
-          fi
+          find artifacts -type f -exec cp {} release-assets/ \;
+          ls -la release-assets
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release-assets/*
+          files: release-assets/*
           generate_release_notes: true
           body: |
-            ## 🔐 Verifying Binaries
+            ## TimeWhisperer ${{ github.ref_name }}
 
-            These binaries were built reproducibly using Nix from [this commit](https://github.com/${{ github.repository }}/commit/${{ github.sha }}).
+            Built from [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) with `cargo build --release`.
 
-            ${{ env.SIGNING_MESSAGE }}
+            ### Assets
+            - `Worklog-*-macos-arm64.pkg` — **macOS installer wizard (recommended)**: installs the app and auto-starts the background monitor. Ad-hoc signed; until notarized, first open needs right-click → Open.
+            - `Worklog-*-macos-arm64.dmg` — drag-to-Applications alternative.
+            - `time-whisperer-linux-amd64` — standalone Linux daemon binary.
 
-            ### Verify hash:
+            ### Verify a download
             ```bash
-            # Verify the hash
-            shasum -a 256 -c timewhisperer-*.sha256
+            shasum -a 256 -c <asset>.sha256
             ```
-
-            ### If signatures are available:
-            
-            **Method 1: Import from GitHub (Recommended)**
-            ```bash
-            # Import public key from GitHub
-            curl -s https://github.com/hyperbach-git.gpg | gpg --import
-            gpg --verify timewhisperer-*.sha256.asc timewhisperer-*.sha256
-            ```
-
-            **Method 2: Import from release assets**
-            ```bash
-            # Import the public key included in this release
-            gpg --import hyperbach-public-key.asc
-            gpg --verify timewhisperer-*.sha256.asc timewhisperer-*.sha256
-            ```
-
-            The original source code for this release is available under the Git tag: [${{ github.ref_name }}](https://github.com/${{ github.repository }}/tree/${{ github.ref_name }}) 

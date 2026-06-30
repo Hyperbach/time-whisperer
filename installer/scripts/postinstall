@@ -1,0 +1,70 @@
+#!/bin/bash
+# Worklog .pkg postinstall.
+#
+# The installer payload drops Worklog.app into /Applications. This script then
+# installs + starts the background daemon as a per-user LaunchAgent for the
+# person running the install (the GUI/console user), so monitoring begins the
+# moment the wizard finishes and resumes at every login.
+#
+# Runs as root during installation, so we resolve the console user explicitly
+# and hand the created files back to them.
+set -e
+
+APP="/Applications/Worklog.app"
+DAEMON="$APP/Contents/Resources/worklogd"
+LABEL="com.hyperbach.worklog"
+
+CONSOLE_USER="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+  # No interactive user (e.g. installed from the login window). The Worklog app
+  # will install the agent itself on first launch — nothing to do here.
+  exit 0
+fi
+
+USER_UID="$(/usr/bin/id -u "$CONSOLE_USER")"
+USER_HOME="$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+[ -z "$USER_HOME" ] && USER_HOME="/Users/$CONSOLE_USER"
+
+LA_DIR="$USER_HOME/Library/LaunchAgents"
+LOG_DIR="$USER_HOME/Library/Logs/Worklog"
+PLIST="$LA_DIR/$LABEL.plist"
+
+/bin/mkdir -p "$LA_DIR" "$LOG_DIR"
+
+/bin/cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$DAEMON</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>$LOG_DIR/output.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_DIR/error.log</string>
+</dict>
+</plist>
+PLISTEOF
+
+# Created as root — give them back to the user so launchd accepts the agent.
+/usr/sbin/chown "$CONSOLE_USER" "$PLIST"
+/usr/sbin/chown -R "$CONSOLE_USER" "$LOG_DIR"
+
+# (Re)load in the user's GUI domain. bootout first so re-installs pick up the
+# new binary; ignore errors (e.g. not currently loaded).
+/bin/launchctl bootout "gui/$USER_UID/$LABEL" 2>/dev/null || true
+/bin/launchctl bootstrap "gui/$USER_UID" "$PLIST" 2>/dev/null \
+  || /bin/launchctl asuser "$USER_UID" /bin/launchctl load -w "$PLIST" 2>/dev/null \
+  || true
+
+exit 0

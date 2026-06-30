@@ -1,19 +1,17 @@
-# Makefile for SneakTime - Upwork Screenshot Monitor
+# Makefile for SneakTime - Upwork Screenshot Monitor (Rust)
 
-# Go commands
-GOCMD=go
-GOBUILD=$(GOCMD) build
-GORUN=$(GOCMD) run
-GOCLEAN=$(GOCMD) clean
+# Cargo commands
+CARGO=cargo
 BINARY_NAME=time-whisperer
+TARGET_DIR=target
 
 # Version info
 VERSION ?= 1.0.0
 COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE=$(shell date -u +%FT%T%z 2>/dev/null || date -u)
 
-# Build flags
-LDFLAGS=-ldflags "-X main.Version=$(VERSION) -X main.GitCommit=$(COMMIT) -X main.BuildDate=$(BUILD_DATE)"
+# Cargo env passes commit/date metadata into the binary via build-time env vars.
+CARGO_ENV=GIT_COMMIT=$(COMMIT) BUILD_DATE=$(BUILD_DATE)
 
 # Installation paths
 PREFIX ?= /usr/local
@@ -47,13 +45,17 @@ help: ## Show this help message
 
 all: build ## Default target: build the application
 
-build: ## Build the binary with local toolchain
-	$(GOBUILD) $(LDFLAGS) -o $(BINARY_NAME) main.go
+build: ## Build the release binary
+	$(CARGO_ENV) $(CARGO) build --release --bin $(BINARY_NAME)
+	cp $(TARGET_DIR)/release/$(BINARY_NAME) ./$(BINARY_NAME)
 	mkdir -p $(BINARY_NAME).app/Contents/Resources
 	cp -r configs $(BINARY_NAME).app/Contents/Resources/
-	
+
 	# Copy platform-specific config to root directory for development convenience
 ifeq ($(UNAME_S), Darwin)
+	# Re-sign the copied binary: cp can invalidate the ad-hoc Mach-O signature,
+	# causing macOS AMFI to SIGKILL ("Killed: 9") the running process.
+	codesign --force --sign - ./$(BINARY_NAME)
 	cp configs/macos/default_config.json config.json
 else ifeq ($(UNAME_S), Linux)
 	cp configs/linux/default_config.json config.json
@@ -61,14 +63,20 @@ else
 	cp configs/windows/default_config.json config.json
 endif
 
-test: ## Run all tests with verbose output
-	$(GOCMD) test -v ./...
+test: ## Run all tests (serial to avoid port contention)
+	$(CARGO) test -- --test-threads=1
 
 run: ## Run the application without installing (development)
-	$(GORUN) main.go
+	$(CARGO_ENV) $(CARGO) run --bin $(BINARY_NAME)
+
+app: ## Build the macOS control-panel .app + .dmg (Worklog)
+	VERSION=$(VERSION) ./package-app.sh
+
+gui: ## Run the control panel GUI in dev (points at the dev daemon)
+	WORKLOG_DAEMON=$(PWD)/target/release/$(BINARY_NAME) $(CARGO) run --release --bin worklog-gui
 
 clean: ## Remove built files and packages
-	$(GOCLEAN)
+	$(CARGO) clean
 	rm -f $(BINARY_NAME)
 	rm -rf build/
 	rm -f *.dmg *.deb

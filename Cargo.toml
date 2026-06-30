@@ -1,0 +1,59 @@
+[package]
+name = "time-whisperer"
+version = "1.0.3"
+edition = "2021"
+description = "SneakTime — Upwork screenshot monitor daemon"
+license = "MIT"
+
+[lib]
+name = "time_whisperer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "time-whisperer"
+path = "src/main.rs"
+
+# macOS control-panel GUI (the user-facing app). Lean daemon stays separate.
+[[bin]]
+name = "worklog-gui"
+path = "src/bin/worklog-gui.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+hyper = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+dirs = "5"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+hex = "0.4"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+glob = "0.3"
+fs2 = "0.4"  # advisory file lock backing the single-instance daemon guard
+
+# GUI control panel (only linked by the worklog-gui binary).
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.29"
+
+[build-dependencies]
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.21"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+filetime = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
